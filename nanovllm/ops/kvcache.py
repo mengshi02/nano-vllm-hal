@@ -1,17 +1,9 @@
-"""KV-cache store op family.
-
-On CUDA the default is the existing triton scatter kernel; other vendors may
-register a fused store (e.g. ``torch_npu`` scatter-on-slot) under their
-``backend_name``.  The triton import is kept local so the package still imports
-on machines without triton.
-"""
 
 from __future__ import annotations
 
 import triton
 import triton.language as tl
 import torch
-
 
 def store_kvcache_default(
     key: torch.Tensor,
@@ -60,7 +52,4 @@ def store_kvcache_default(
         D,
     )
 
-
-# Convenience alias so op families can register a backend-specific store under a
-# clear name without renaming the default.
 store_kvcache = store_kvcache_default

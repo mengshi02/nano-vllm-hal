@@ -1,9 +1,7 @@
-"""RMSNorm op family -- default torch-generic implementation."""
 
 from __future__ import annotations
 
 import torch
-
 
 def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     orig_dtype = x.dtype
@@ -12,7 +10,6 @@ def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
     x = x.mul_(torch.rsqrt(var + eps))
     x = x.to(orig_dtype).mul_(weight)
     return x
-
 
 def add_rms_norm_forward(
     x: torch.Tensor,

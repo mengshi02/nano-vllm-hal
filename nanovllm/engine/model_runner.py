@@ -28,7 +28,6 @@ class ModelRunner:
         self.platform.init_process_group(self.world_size, rank)
         self.platform.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        # transformers>=4.56 renamed hf_config.dtype -> torch_dtype; 4.5x exposes only torch_dtype.
         torch.set_default_dtype(getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype"))
         self.platform.set_default_device()
         self.model = Qwen3ForCausalLM(hf_config)

@@ -1,15 +1,9 @@
-"""CPU fallback platform.
-
-Used only so the package imports cleanly on a machine without any accelerator
-drivers installed.  Not a functional inference backend.
-"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from nanovllm.platforms.interface import Platform
-
 
 class CPUPlatform(Platform):
     backend_name = "cpu"

@@ -1,10 +1,3 @@
-"""NVIDIA CUDA platform -- the reference backend.
-
-This is a pure move of the ``torch.cuda`` / ``nccl`` calls that currently live
-inlined in ``ModelRunner``.  Behaviour is intentionally identical so that the
-HAL refactor can be validated with a CUDA smoke run before any other vendor is
-wired in.
-"""
 
 from __future__ import annotations
 
@@ -14,7 +7,6 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.platforms.interface import Platform
-
 
 class CUDAPlatform(Platform):
     backend_name = "nvidia"
