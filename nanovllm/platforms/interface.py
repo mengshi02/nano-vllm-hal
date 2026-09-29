@@ -18,6 +18,9 @@ class Platform:
     def device_count(self) -> int:
         raise NotImplementedError
 
+    def device(self) -> Any:
+        raise NotImplementedError
+
     def current_device(self) -> int:
         raise NotImplementedError
 

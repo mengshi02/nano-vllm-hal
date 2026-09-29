@@ -1,6 +1,14 @@
 # nano-vllm-hal
 
-A lightweight vLLM implementation (~1,200 lines) with a **Hardware Abstraction Layer (HAL)**, rebuilt from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
+**A complete miniature of vLLM v1, in ~2,000 lines — the codebase to read first if you want to understand vLLM.**
+
+Built on top of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) (~1,300 lines, a from-scratch lightweight vLLM), we added **~800 lines** that turn it into a faithful, scaled-down vLLM v1: the same `Platform`/op-family hardware abstraction, the same continuous batching / paged KV cache engine, the same What-vs-How separation — small enough to read in an afternoon, real enough to run Qwen3 end-to-end on production hardware.
+
+| | lines | what it is |
+|---|---|---|
+| engine core (inherited) | ~1,300 | scheduler, block manager, paged KV cache, TP, CUDA graph — the "What" |
+| **HAL layer (added)** | **~800** | `platforms/` + `ops/` — device, memory, comm, kernels — the "How" |
+| **total** | **~2,000** | a readable, runnable miniature of vLLM v1 |
 
 One engine, four hardware targets:
 
@@ -8,16 +16,16 @@ One engine, four hardware targets:
 |---|---|---|---|
 | NVIDIA | `torch.cuda` | `nccl` | triton + flash-attn (default, reference) |
 | Hygon DCU | ROCm | `nccl` (ROCm build) | ROCm fused ops |
-| Ascend NPU | `torch_npu` | `hccl` | `torch_npu._p_attention` etc. |
+| Ascend NPU | `torch_npu` | `hccl` | `torch_npu` fused attention ops |
 | Moore Threads | `torch_musa` | `mccl` | MUSA fusion kernels |
 
 ## Design
 
-Following vLLM's `Platform`/`Hardware` split: **what to compute** (engine, model) and **how to compute it** (device, kernels) are strictly separated.
+Mirrors vLLM v1's `Platform`/`Hardware` split: **what to compute** (engine, model) and **how to compute it** (device, kernels) are strictly separated.
 
-- `nanovllm/platforms/` — one `Platform` class per hardware backend. `current_platform` is resolved once at import (`Ascend → MUSA → ROCm → CUDA → CPU`) and the engine only ever talks to it.
-- `nanovllm/ops/` — operator families (attention / kv-cache store / rms-norm / rope). Each family has a torch-generic default; a vendor registers its kernel under its `backend_name` and the runtime picks it via `current_platform.backend_name`.
-- `nanovllm/engine/`, `nanovllm/layers/`, `nanovllm/models/` — hardware-agnostic. Adding a new backend never touches these.
+- `nanovllm/platforms/` — one `Platform` class per backend. `current_platform` is resolved once at import (`Ascend → MUSA → ROCm → CUDA → CPU`) and the engine only ever talks to it: device, memory, process group, graph capture.
+- `nanovllm/ops/` — operator families (attention / kv-cache store / rms-norm / rope). Each family has a default implementation; a vendor registers its kernel under its `backend_name` and the runtime picks it via `current_platform.backend_name`.
+- `nanovllm/engine/`, `nanovllm/layers/`, `nanovllm/models/` — hardware-agnostic, never change when a backend is added.
 
 ```python
 from nanovllm.ops import register, _KV_CACHE
@@ -58,5 +66,6 @@ The engine stays untouched.
 ## Status
 
 - [x] Phase 1: HAL skeleton — platforms + op families, engine rewired to `current_platform`
-- [x] CUDA smoke verified on H20 (Qwen3-0.6B, zero behavior change vs upstream)
-- [ ] Ascend / ROCm / MUSA real kernels (stubs in place, pending vendor SDKs)
+- [x] CUDA production-ready on H20: bench.py 256 concurrent sequences, 134k tokens, 3,388 tok/s, zero failures
+- [x] Ascend 910B4 bring-up: real kernels via `torch_npu` fused attention ops; bench.py 256 concurrent sequences, 134k tokens, 612 tok/s, zero failures
+- [ ] Hygon DCU / Moore Threads real kernels (stubs in place)

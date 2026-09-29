@@ -23,6 +23,9 @@ class CUDAPlatform(Platform):
     def device_count(self) -> int:
         return torch.cuda.device_count()
 
+    def device(self):
+        return torch.device("cuda")
+
     def current_device(self) -> int:
         return torch.cuda.current_device()
 

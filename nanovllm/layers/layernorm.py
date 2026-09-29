@@ -1,6 +1,14 @@
 import torch
 from torch import nn
 
+from nanovllm.platforms import current_platform
+
+
+def _maybe_compile(fn):
+    if current_platform.backend_name == "ascend":
+        return fn
+    return torch.compile(fn)
+
 
 class RMSNorm(nn.Module):
 
@@ -13,7 +21,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
+    @_maybe_compile
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -25,7 +33,7 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
+    @_maybe_compile
     def add_rms_forward(
         self,
         x: torch.Tensor,

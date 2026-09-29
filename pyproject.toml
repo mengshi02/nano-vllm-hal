@@ -13,13 +13,14 @@ description = "A lightweight vLLM implementation with a hardware abstraction lay
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
-    "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
+    "safetensors",
     "xxhash",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
+nvidia = ["triton>=3.0.0", "flash-attn"]
 ascend = ["torch-npu"]
 musa = ["torch-musa"]
 

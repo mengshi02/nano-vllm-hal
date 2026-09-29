@@ -43,6 +43,11 @@ class AscendPlatform(Platform):
     def device_count(self) -> int:
         return self.device_module.npu.device_count()
 
+    def device(self) -> Any:
+        import torch
+
+        return torch.device("npu")
+
     def current_device(self) -> int:
         return self.device_module.npu.current_device()
 
@@ -52,9 +57,9 @@ class AscendPlatform(Platform):
         torch_npu.npu.set_device(rank)
 
     def set_default_device(self) -> None:
-        import torch_npu
+        import torch
 
-        torch_npu.set_device("npu")
+        torch.set_default_device("npu")
 
     def mem_get_info(self) -> tuple[int, int]:
         return self.device_module.npu.mem_get_info()

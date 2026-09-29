@@ -1,10 +1,18 @@
 import torch
 from torch import nn
 
+from nanovllm.platforms import current_platform
+
+
+def _maybe_compile(fn):
+    if current_platform.backend_name == "ascend":
+        return fn
+    return torch.compile(fn)
+
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    @_maybe_compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

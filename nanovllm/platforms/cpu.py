@@ -20,6 +20,11 @@ class CPUPlatform(Platform):
     def device_count(self) -> int:
         return 0
 
+    def device(self) -> Any:
+        import torch
+
+        return torch.device("cpu")
+
     def current_device(self) -> int:
         return 0
 
