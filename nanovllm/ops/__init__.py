@@ -31,6 +31,17 @@ def _register_ascend_ops():
 
 _register_ascend_ops()
 
+def _register_musa_ops():
+    try:
+        from nanovllm.ops import musa_attention, musa_kvcache
+
+        _ATTENTION["musa"] = musa_attention.attention_forward
+        _KV_CACHE["musa"] = musa_kvcache.store_kvcache_musa
+    except ImportError:
+        pass
+
+_register_musa_ops()
+
 def register(family: dict[str, Any], backend_name: str):
     def deco(fn):
         family[backend_name] = fn

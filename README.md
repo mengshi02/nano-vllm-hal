@@ -68,4 +68,5 @@ The engine stays untouched.
 - [x] Phase 1: HAL skeleton — platforms + op families, engine rewired to `current_platform`
 - [x] CUDA production-ready on H20: bench.py 256 concurrent sequences, 134k tokens, 3,388 tok/s, zero failures
 - [x] Ascend 910B4 bring-up: real kernels via `torch_npu` fused attention ops; bench.py 256 concurrent sequences, 134k tokens, 612 tok/s, zero failures
-- [ ] Hygon DCU / Moore Threads real kernels (stubs in place)
+- [x] Moore Threads S5000 bring-up: real kernels via MUSA `mate` attention; bench.py 256 concurrent sequences, 134k tokens, 236 tok/s, zero failures
+- [ ] Hygon DCU real kernels (stub in place)

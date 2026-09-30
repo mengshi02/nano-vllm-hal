@@ -118,3 +118,36 @@ class MUSAPlatform(CUDAPlatform):
         import torch.distributed as dist
 
         dist.init_process_group("mccl", "tcp://localhost:2333", world_size=world_size, rank=rank)
+
+    def is_capture_supported(self) -> bool:
+        return False
+
+    def set_device(self, rank: int) -> None:
+        import torch_musa
+
+        torch_musa.set_device(rank)
+
+    def set_default_device(self) -> None:
+        import torch
+
+        torch.set_default_device("musa")
+
+    def device(self) -> Any:
+        import torch
+
+        return torch.device("musa")
+
+    def mem_get_info(self) -> tuple[int, int]:
+        return self.device_module.mem_get_info()
+
+    def empty_cache(self) -> None:
+        self.device_module.empty_cache()
+
+    def reset_peak_memory_stats(self) -> None:
+        self.device_module.reset_peak_memory_stats()
+
+    def memory_stats(self) -> dict[str, Any]:
+        return self.device_module.memory_stats()
+
+    def synchronize(self) -> None:
+        self.device_module.synchronize()
