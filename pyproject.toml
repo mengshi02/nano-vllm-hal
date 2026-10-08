@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-vllm-hal"
+version = "0.1.0"
+authors = [{ name = "mengshi" }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "A lightweight vLLM implementation with a hardware abstraction layer, supporting NVIDIA / Hygon DCU / Ascend NPU / Moore Threads"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "safetensors",
+    "xxhash",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+nvidia = ["triton>=3.0.0", "flash-attn"]
+ascend = ["torch-npu"]
+musa = ["torch-musa"]
+
+[project.urls]
+Homepage = "https://github.com/mengshi02/nano-vllm-hal"
+Repository = "https://github.com/mengshi02/nano-vllm-hal"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanovllm*"]
