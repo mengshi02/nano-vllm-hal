@@ -37,8 +37,6 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -65,9 +63,8 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -79,9 +76,8 @@ class Qwen3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
@@ -130,7 +126,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
+            qkv_bias=config.attention_bias,
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
@@ -199,8 +195,27 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.tie_word_embeddings = config.tie_word_embeddings
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+    def expected_weight_names(self) -> set[str]:
+        expected = set()
+        for name, _ in self.named_parameters():
+            if name == "lm_head.weight" and self.tie_word_embeddings:
+                continue
+            unpacked_names = [
+                name.replace(f".{packed}.", f".{unpacked}.", 1)
+                for unpacked, (packed, _) in self.packed_modules_mapping.items()
+                if f".{packed}." in name
+            ]
+            expected.update(unpacked_names or [name])
+        return expected
+
+    def tied_weight_groups(self) -> tuple[set[str], ...]:
+        if self.tie_word_embeddings:
+            return ({"model.embed_tokens.weight", "lm_head.weight"},)
+        return ()
 
     def forward(
         self,
