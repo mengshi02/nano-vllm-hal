@@ -1,8 +1,7 @@
-import pickle
+import traceback
 import torch
 import torch.distributed as dist
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.connection import Connection
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
@@ -11,84 +10,49 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.platforms import current_platform
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.parallel import init_tensor_parallel_group, layer_range
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.tp_size = config.tensor_parallel_size
+        self.pp_size = config.pipeline_parallel_size
+        self.world_size = self.tp_size * self.pp_size
         self.rank = rank
-        self.event = event
+        self.tp_rank = rank % self.tp_size
+        self.pp_rank = rank // self.tp_size
+        self.local_layers = layer_range(hf_config.num_hidden_layers, self.pp_size, self.pp_rank)
         self.platform = current_platform
 
-        self.platform.init_process_group(self.world_size, rank)
-        self.platform.set_device(rank)
+        self.platform.set_device(config.device_offset + rank)
+        self.platform.init_process_group(self.world_size, rank, config.init_method)
+        init_tensor_parallel_group(self.tp_size, self.pp_size, rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype"))
         self.platform.set_default_device()
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen3ForCausalLM(hf_config, self.pp_rank, self.pp_size,
+                                      tp_fp32_matmul=config.tp_fp32_matmul)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager and self.platform.is_capture_supported():
+        if self.pp_size == 1 and not self.enforce_eager and self.platform.is_capture_supported():
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()
-
     def exit(self):
         if self.world_size > 1:
-            self.shm.close()
             dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager and self.platform.is_capture_supported():
+        if self.pp_size == 1 and not self.enforce_eager and self.platform.is_capture_supported():
             del self.graphs, self.graph_pool
         self.platform.synchronize()
         self.platform.destroy_process_group()
-
-    def loop(self):
-        while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
-                break
-
-    def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
-
-    def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
-
-    def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
-        method = getattr(self, method_name, None)
-        return method(*args)
 
     def warmup_model(self):
         self.platform.empty_cache()
@@ -99,7 +63,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(seqs)
         self.platform.empty_cache()
 
     def allocate_kv_cache(self):
@@ -110,22 +74,43 @@ class ModelRunner:
         used = total - free
         peak = self.platform.memory_stats()["allocated_bytes.all.peak"]
         current = self.platform.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * model_dtype.itemsize
+        block_bytes = 2 * len(self.local_layers) * self.block_size * num_kv_heads * head_dim * model_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         if self.world_size > 1:
             num_blocks = torch.tensor([config.num_kvcache_blocks], dtype=torch.int64, device=self.platform.device())
             dist.all_reduce(num_blocks, op=dist.ReduceOp.MIN)
             config.num_kvcache_blocks = int(num_blocks.item())
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        if config.num_kvcache_blocks <= 0:
+            raise ValueError("Insufficient memory for KV cache on at least one TP/PP rank")
+        self.kv_cache = torch.empty(2, len(self.local_layers), config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        assert layer_id == len(self.local_layers)
+
+    def export_kv(self, block_ids: list[int], num_tokens: int) -> torch.Tensor:
+        """Copy the prompt's physical blocks to CPU in logical block order."""
+        if num_tokens <= 0 or len(block_ids) != (num_tokens + self.block_size - 1) // self.block_size:
+            raise ValueError("Invalid prompt KV block table")
+        blocks = self.kv_cache[:, :, block_ids].cpu()
+        tail = num_tokens % self.block_size
+        if tail:
+            blocks[:, :, -1, tail:].zero_()
+        return blocks
+
+    def import_kv(self, block_ids: list[int], num_tokens: int, blocks: torch.Tensor) -> None:
+        """Install CPU KV into independently allocated local physical blocks."""
+        expected = (2, len(self.local_layers), len(block_ids), *self.kv_cache.shape[3:])
+        if (num_tokens <= 0 or len(block_ids) != (num_tokens + self.block_size - 1) // self.block_size
+                or blocks.device.type != "cpu" or blocks.shape != expected
+                or blocks.dtype != self.kv_cache.dtype):
+            raise ValueError("Incompatible prompt KV cache")
+        self.kv_cache[:, :, block_ids] = blocks.to(self.platform.device())
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -147,7 +132,8 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            if self.pp_rank == 0:
+                input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -168,7 +154,8 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.platform.device(), non_blocking=True)
+        input_ids = (torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)
+                     .to(self.platform.device(), non_blocking=True) if self.pp_rank == 0 else None)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.platform.device(), non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.platform.device(), non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.platform.device(), non_blocking=True)
@@ -182,11 +169,13 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
+            if self.pp_rank == 0:
+                input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.platform.device(), non_blocking=True)
+        input_ids = (torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)
+                     .to(self.platform.device(), non_blocking=True) if self.pp_rank == 0 else None)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.platform.device(), non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.platform.device(), non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.platform.device(), non_blocking=True)
@@ -199,9 +188,29 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).to(self.platform.device(), non_blocking=True)
         return temperatures
 
+    def prepare_mixed(self, seqs: list[Sequence]):
+        decode_seqs = [seq for seq in seqs if not seq.is_prefill]
+        prefill_seqs = [seq for seq in seqs if seq.is_prefill]
+        assert seqs == decode_seqs + prefill_seqs
+        decode_ids, decode_positions = self.prepare_decode(decode_seqs)
+        decode_context = get_context()
+        prefill_ids, prefill_positions = self.prepare_prefill(prefill_seqs)
+        prefill_context = get_context()
+        num_decode = len(decode_seqs)
+        last_prefill = prefill_context.cu_seqlens_q[1:] - 1 + num_decode
+        last_indices = torch.cat((torch.arange(num_decode, device=self.platform.device()), last_prefill))
+        set_context(False,
+                    slot_mapping=torch.cat((decode_context.slot_mapping, prefill_context.slot_mapping)),
+                    decode_context=decode_context, prefill_context=prefill_context,
+                    num_decode_tokens=num_decode, last_token_indices=last_indices)
+        ids = (torch.cat((decode_ids, prefill_ids)) if self.pp_rank == 0 else None)
+        return ids, torch.cat((decode_positions, prefill_positions))
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512 or not self.platform.is_capture_supported():
+        assert self.pp_size == 1
+        if (is_prefill or get_context().prefill_context is not None or self.enforce_eager or
+                input_ids.size(0) > 512 or not self.platform.is_capture_supported()):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -218,13 +227,56 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    def run(self, seqs: list[Sequence]) -> list[int]:
+        is_prefill = all(seq.is_prefill for seq in seqs)
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        elif all(not seq.is_prefill for seq in seqs):
+            input_ids, positions = self.prepare_decode(seqs)
+        else:
+            input_ids, positions = self.prepare_mixed(seqs)
+        if self.pp_size == 1:
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        else:
+            token_ids = self.run_pipeline(input_ids, positions, seqs)
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_pipeline(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
+                     seqs: list[Sequence]) -> list[int] | None:
+        hidden_states = residual = None
+        if self.pp_rank:
+            shape = (positions.numel(), self.config.hf_config.hidden_size)
+            dtype = next(self.model.parameters()).dtype
+            hidden_states = torch.empty(shape, dtype=dtype, device=self.platform.device())
+            residual = torch.empty_like(hidden_states)
+            source = self.rank - self.tp_size
+            dist.recv(hidden_states, src=source)
+            dist.recv(residual, src=source)
+        output = self.model(input_ids if self.pp_rank == 0 else None, positions,
+                            hidden_states, residual)
+        if self.pp_rank < self.pp_size - 1:
+            hidden_states, residual = output
+            destination = self.rank + self.tp_size
+            dist.send(hidden_states.contiguous(), dst=destination)
+            dist.send(residual.contiguous(), dst=destination)
+        else:
+            logits = self.model.compute_logits(output)
+            if self.tp_rank == 0:
+                temperatures = self.prepare_sample(seqs)
+                sampled = self.sampler(logits, temperatures)
+                if self.rank != 0:
+                    dist.send(sampled.contiguous(), dst=0)
+                else:
+                    return sampled.tolist()
+        if self.rank == 0:
+            sampled = torch.empty(len(seqs), dtype=torch.int64, device=self.platform.device())
+            dist.recv(sampled, src=(self.pp_size - 1) * self.tp_size)
+            return sampled.tolist()
+        return None
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -262,3 +314,30 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+
+def start_model_runner(config: Config, rank: int, connection: Connection):
+    try:
+        Sequence.block_size = config.kvcache_block_size
+        runner = ModelRunner(config, rank)
+        connection.send(("ready", config.num_kvcache_blocks))
+        while True:
+            method_name, args = connection.recv()
+            if method_name == "exit":
+                runner.exit()
+                connection.send(("ok", None))
+                break
+            result = getattr(runner, method_name)(*args)
+            connection.send(("ok", result if rank == 0 or method_name == "export_kv" else None))
+            # Drop both exported results and imported arguments after use;
+            # retaining either keeps a potentially large /dev/shm KV file alive.
+            result = None
+            args = None
+    except BaseException:
+        try:
+            connection.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        raise
+    finally:
+        connection.close()

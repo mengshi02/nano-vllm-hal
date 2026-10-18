@@ -32,10 +32,9 @@ def _gather_paged_kv_to_dense(
     gathered_k = k_cache[blocks]
     gathered_v = v_cache[blocks]
     lens = torch.tensor(seq_lens, dtype=torch.long, device=k_cache.device)
-    mask = torch.arange(block_size, device=k_cache.device)[None, None, :] < lens[:, None, None]
-    dense_k = gathered_k.permute(0, 1, 3, 2, 4).reshape(len(seq_lens), num_blocks * block_size, num_kv_heads, head_dim)
-    dense_v = gathered_v.permute(0, 1, 3, 2, 4).reshape(len(seq_lens), num_blocks * block_size, num_kv_heads, head_dim)
-    lens_per_token = mask.expand(-1, num_blocks, -1).reshape(len(seq_lens), num_blocks * block_size)
+    lens_per_token = torch.arange(num_blocks * block_size, device=k_cache.device)[None, :] < lens[:, None]
+    dense_k = gathered_k.reshape(len(seq_lens), num_blocks * block_size, num_kv_heads, head_dim)
+    dense_v = gathered_v.reshape(len(seq_lens), num_blocks * block_size, num_kv_heads, head_dim)
     dense_k = dense_k[lens_per_token].reshape(-1, num_kv_heads, head_dim)
     dense_v = dense_v[lens_per_token].reshape(-1, num_kv_heads, head_dim)
     actual_seq_lengths_kv = []
@@ -58,29 +57,39 @@ def _paged_prefill(
     num_heads = q.shape[-2]
     head_dim = q.shape[-1]
     num_kv_heads = k_cache.shape[-2]
+    q_offsets = context.cu_seqlens_q.tolist()
+    k_offsets = context.cu_seqlens_k.tolist()
     context_lens = torch.tensor(
-        context.cu_seqlens_k.tolist(), dtype=torch.int32, device=q.device
-    ) if context.context_lens is None else context.context_lens
+        [end - start for start, end in zip(k_offsets, k_offsets[1:])],
+        dtype=torch.int32, device=q.device,
+    )
     k, v, actual_seq_lengths_kv = _gather_paged_kv_to_dense(
         k_cache, v_cache, context.block_tables, context_lens, num_kv_heads, head_dim
     )
-    seq_lens = actual_seq_lengths_kv
-    qlens = context.cu_seqlens_q.tolist()
-    o = torch_npu.npu_fusion_attention(
-        query=q,
-        key=k,
-        value=v,
-        head_num=num_heads,
-        input_layout="TND",
-        scale=scale,
-        pre_tockens=2147483647,
-        next_tockens=0,
-        actual_seq_qlen=qlens,
-        actual_seq_kvlen=seq_lens,
-        sparse_mode=0,
-        atten_mask=_causal_mask(qlens, q.shape[0], q.device),
-    )[0]
-    return o
+    outputs = []
+    for i in range(len(q_offsets) - 1):
+        q_start, q_end = q_offsets[i:i + 2]
+        k_start = 0 if i == 0 else actual_seq_lengths_kv[i - 1]
+        k_end = actual_seq_lengths_kv[i]
+        q_len, k_len = q_end - q_start, k_end - k_start
+        q_positions = torch.arange(q_len, device=q.device) + k_len - q_len
+        k_positions = torch.arange(k_len, device=q.device)
+        mask = k_positions[None, :] > q_positions[:, None]
+        outputs.append(torch_npu.npu_fusion_attention(
+            query=q[q_start:q_end],
+            key=k[k_start:k_end],
+            value=v[k_start:k_end],
+            head_num=num_heads,
+            input_layout="TND",
+            scale=scale,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            actual_seq_qlen=[q_len],
+            actual_seq_kvlen=[k_len],
+            sparse_mode=0,
+            atten_mask=mask,
+        )[0])
+    return torch.cat(outputs)
 
 
 def attention_forward_ascend(

@@ -2,73 +2,33 @@
   <img src="assets/logo.optimized.png" alt="nano-vllm-hal" width="560">
 </p>
 
-**A complete miniature of vLLM v1, in ~2,000 lines — the codebase to read first if you want to understand vLLM.**
+# nano-vllm-hal
 
-Built on top of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) (~1,200 lines, a from-scratch lightweight vLLM), we added **~700 lines** that turn it into a faithful, scaled-down vLLM v1: the same `Platform`/op-family hardware abstraction, the same continuous batching / paged KV cache engine, the same What-vs-How separation — small enough to read in an afternoon, real enough to run Qwen3 end-to-end on production hardware.
+A small, readable inference engine based on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm), extended with hardware abstraction, tensor/pipeline parallelism, and educational prefill/decode (PD) separation. It runs Qwen3 on NVIDIA CUDA, Moore Threads MUSA, Ascend NPU, and Hygon DCU with the appropriate runtimes.
 
-| | lines | what it is |
-|---|---|---|
-| engine core (inherited) | ~1,200 | scheduler, block manager, paged KV cache, TP, CUDA graph — the "What" |
-| **HAL layer (added)** | **~700** | `platforms/` + `ops/` — device, memory, comm, kernels — the "How" |
-| **total** | **~2,000** | a readable, runnable miniature of vLLM v1 |
+## Quick start
 
-One engine, four hardware targets:
+Install the dependencies for your hardware runtime and set the local Qwen3 model path in `example.py` and `bench.py` before running them:
 
-| Vendor | Runtime | Comm backend | Attention / KV entry point |
-|---|---|---|---|
-| NVIDIA | `torch.cuda` | `nccl` | triton + flash-attn (default, reference) |
-| Hygon DCU | DTK (HIP) | `nccl` (HIP build) | triton + flash-attn (shares the default family) |
-| Ascend NPU | `torch_npu` | `hccl` | `torch_npu` fused attention ops |
-| Moore Threads | `torch_musa` | `mccl` | MUSA fusion kernels |
-
-## Design
-
-Mirrors vLLM v1's `Platform`/`Hardware` split: **what to compute** (engine, model) and **how to compute it** (device, kernels) are strictly separated.
-
-- `nanovllm/platforms/` — one `Platform` class per backend. `current_platform` is resolved once at import (`Ascend → MUSA → Hygon → ROCm → CUDA → CPU`) and the engine only ever talks to it: device, memory, process group, graph capture.
-- `nanovllm/ops/` — operator families (attention / kv-cache store / rms-norm / rope). Each family has a default implementation; a vendor registers its kernel under its `backend_name` and the runtime picks it via `current_platform.backend_name`.
-- `nanovllm/engine/`, `nanovllm/layers/`, `nanovllm/models/` — hardware-agnostic, never change when a backend is added.
-
-```python
-from nanovllm.ops import register, _KV_CACHE
-
-@register(_KV_CACHE, "musa")
-def store_kvcache_musa(key, value, k_cache, v_cache, slot_mapping):
-    ...  # vendor kernel
+```bash
+python example.py
+python bench.py
 ```
-
-## Usage
 
 ```python
 from nanovllm import LLM, SamplingParams
 
-llm = LLM("Qwen/Qwen3-0.6B", enforce_eager=True)
-prompts = ["introduce yourself", "list all prime numbers within 100"]
-outputs = llm.generate(prompts, SamplingParams(temperature=0.6, max_tokens=256))
+llm = LLM("/path/to/Qwen3-0.6B", enforce_eager=True)
+outputs = llm.generate(["Introduce yourself"], SamplingParams(max_tokens=32))
 ```
 
-Or run the included examples:
+The engine supports continuous batching, paged KV cache with prefix reuse, chunked prefill, TP, and synchronous PP. For PD separation, start a decode process and connect a separate prefill process:
 
 ```bash
-python example.py   # end-to-end smoke
-python bench.py     # throughput benchmark
+# Decode host
+python3 pd_remote.py decode /path/to/Qwen3-0.6B --bind 0.0.0.0
+# Prefill host
+python3 pd_remote.py prefill /path/to/Qwen3-0.6B --host D_HOST --cross-block --compare
 ```
 
-Features: continuous batching, paged KV cache (prefix caching, block reuse), tensor parallelism, CUDA-graph decode, torch.compile.
-
-## Adding a new backend
-
-1. Add `nanovllm/platforms/<vendor>.py` implementing the `Platform` interface (`backend_name` / `device_name` / `dispatch_key` + device, memory, comm, graph-capture methods).
-2. Insert the class into `_PLATFORMS` in `nanovllm/platforms/__init__.py` (before `CUDAPlatform` if the vendor runtime is CUDA-compatible).
-3. Register vendor kernels under `nanovllm/ops/` with `@register(family, "<backend_name>")`.
-4. Only if the backend needs model-level dispatch differences, branch on `current_platform.dispatch_key` inside `nanovllm/models/`.
-
-The engine stays untouched.
-
-## Status
-
-- [x] Phase 1: HAL skeleton — platforms + op families, engine rewired to `current_platform`
-- [x] CUDA production-ready on H20: bench.py 256 concurrent sequences, 134k tokens, 7,570 tok/s (exclusive GPU, NGC public image), 3,388 on a shared GPU; zero failures
-- [x] Ascend 910B4 bring-up: real kernels via `torch_npu` fused attention ops; bench.py 256 concurrent sequences, 134k tokens, 612 tok/s, zero failures
-- [x] Moore Threads S5000 bring-up: real kernels via MUSA `mate` attention; bench.py 256 concurrent sequences, 134k tokens, 236 tok/s, zero failures
-- [x] Hygon DCU BW1102 bring-up: DTK/HIP runtime reuses the default triton + flash-attn family unchanged; bench.py 256 concurrent sequences, 134k tokens, 4,326 tok/s, zero failures
+P and D need matching model weights and TP/PP settings. This learning-oriented path uses CPU-staged KV transfer over TCP; see the guide for multi-card layouts, multi-P/D routing, verification, and limitations.

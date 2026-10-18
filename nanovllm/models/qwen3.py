@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -9,6 +8,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.parallel import get_tp_size, layer_range
 
 
 class Qwen3Attention(nn.Module):
@@ -24,9 +24,10 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        tp_fp32_matmul: bool = False,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -48,6 +49,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            fp32_matmul=tp_fp32_matmul,
         )
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
@@ -91,6 +93,7 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        tp_fp32_matmul: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -102,6 +105,7 @@ class Qwen3MLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
+            fp32_matmul=tp_fp32_matmul,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -118,6 +122,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        tp_fp32_matmul: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -130,11 +135,13 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            tp_fp32_matmul=tp_fp32_matmul,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            tp_fp32_matmul=tp_fp32_matmul,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -160,23 +167,40 @@ class Qwen3Model(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        tp_fp32_matmul: bool = False,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.is_first = pp_rank == 0
+        self.is_last = pp_rank == pp_size - 1
+        self.local_layers = layer_range(config.num_hidden_layers, pp_size, pp_rank)
+        # The last stage also owns an embedding when weights are tied to its head.
+        if self.is_first or (self.is_last and config.tie_word_embeddings):
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config, tp_fp32_matmul) if i in self.local_layers else nn.Identity()
+            for i in range(config.num_hidden_layers)
+        ])
+        if self.is_last:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for layer in self.layers:
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.is_first:
+            hidden_states = self.embed_tokens(input_ids)
+        for i in self.local_layers:
+            layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if self.is_last:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
+        return hidden_states, residual
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -190,13 +214,17 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen3Config,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        tp_fp32_matmul: bool = False,
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = Qwen3Model(config, pp_rank, pp_size, tp_fp32_matmul)
+        if self.model.is_last:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.tie_word_embeddings = config.tie_word_embeddings
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings and self.model.is_last:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def expected_weight_names(self) -> set[str]:
@@ -219,10 +247,12 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        hidden_states: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.model(input_ids, positions, hidden_states, residual)
 
     def compute_logits(
         self,

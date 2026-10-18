@@ -14,10 +14,10 @@ class ROCmPlatform(CUDAPlatform):
 
         return torch.version.hip is not None
 
-    def init_process_group(self, world_size: int, rank: int) -> None:
+    def init_process_group(self, world_size: int, rank: int, init_method: str = "tcp://localhost:2333") -> None:
         import torch.distributed as dist
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=world_size, rank=rank)
+        dist.init_process_group("nccl", init_method, world_size=world_size, rank=rank)
 
 _HYGON_ARCHS = ("gfx926", "gfx928", "gfx936", "gfx938")
 
@@ -108,10 +108,10 @@ class HygonPlatform(Platform):
 
         torch.cuda.synchronize()
 
-    def init_process_group(self, world_size: int, rank: int) -> None:
+    def init_process_group(self, world_size: int, rank: int, init_method: str = "tcp://localhost:2333") -> None:
         import torch.distributed as dist
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=world_size, rank=rank)
+        dist.init_process_group("nccl", init_method, world_size=world_size, rank=rank)
 
     def destroy_process_group(self) -> None:
         import torch.distributed as dist
@@ -185,10 +185,12 @@ class AscendPlatform(Platform):
     def synchronize(self) -> None:
         self.device_module.npu.synchronize()
 
-    def init_process_group(self, world_size: int, rank: int) -> None:
+    def init_process_group(self, world_size: int, rank: int, init_method: str = "tcp://localhost:2333") -> None:
+        import os
         import torch.distributed as dist
 
-        dist.init_process_group("hccl", "tcp://localhost:2333", world_size=world_size, rank=rank)
+        os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        dist.init_process_group("hccl", init_method, world_size=world_size, rank=rank)
 
     def destroy_process_group(self) -> None:
         import torch.distributed as dist
@@ -222,10 +224,13 @@ class MUSAPlatform(CUDAPlatform):
         except ImportError:
             return False
 
-    def init_process_group(self, world_size: int, rank: int) -> None:
+    def device_count(self) -> int:
+        return self.device_module.device_count()
+
+    def init_process_group(self, world_size: int, rank: int, init_method: str = "tcp://localhost:2333") -> None:
         import torch.distributed as dist
 
-        dist.init_process_group("mccl", "tcp://localhost:2333", world_size=world_size, rank=rank)
+        dist.init_process_group("mccl", init_method, world_size=world_size, rank=rank)
 
     def is_capture_supported(self) -> bool:
         return False

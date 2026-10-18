@@ -29,5 +29,15 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             self._store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        o = self._attention(q, k, v, k_cache, v_cache, self.scale, context)
+        if context.prefill_context is not None:
+            n = context.num_decode_tokens
+            decoded = self._attention(q[:n], k[:n], v[:n], k_cache, v_cache,
+                                      self.scale, context.decode_context)
+            prefetched = self._attention(q[n:], k[n:], v[n:], k_cache, v_cache,
+                                         self.scale, context.prefill_context)
+            # Decode kernels may return [batch, 1, heads, dim], while prefill
+            # kernels return [tokens, heads, dim]. Normalize before combining.
+            o = torch.cat((decoded.reshape_as(q[:n]), prefetched.reshape_as(q[n:])))
+        else:
+            o = self._attention(q, k, v, k_cache, v_cache, self.scale, context)
         return o
