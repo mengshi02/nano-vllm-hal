@@ -2,8 +2,6 @@ import torch.distributed as dist
 
 
 _tp_group = None
-_dp_group = None
-_ep_group = None
 _tp_size = 1
 _dp_size = 1
 _ep_size = 1
@@ -11,7 +9,6 @@ _pp_size = 1
 _ep_rank = 0
 _expert_tensor_parallel_size = 1
 _expert_tensor_parallel_rank = 0
-_data_parallel_ep = False
 
 
 def init_tensor_parallel_group(tp_size: int, pp_size: int, rank: int,
@@ -41,43 +38,28 @@ def init_parallel_groups(tp_size: int, pp_size: int, rank: int,
                          dp_size: int = 1, ep_size: int = 1):
     """Initialize TP groups and the MoE expert-placement metadata.
 
-    The primary EP layout is a sub-dimension of TP: EP groups of experts are
-    placed across the TP ranks of each pipeline stage.  A TP=1, DP=EP layout is
-    also supported as a data-parallel expert layout for the already validated
-    two-worker OLMoE path.
+    EP is a sub-dimension of TP: expert groups are placed across the TP ranks
+    of each pipeline stage, and each expert is optionally sharded across the
+    remaining expert-tensor-parallel ranks.
     """
-    global _dp_group, _dp_size, _ep_group, _ep_size, _pp_size, _ep_rank
+    global _dp_size, _ep_size, _pp_size, _ep_rank
     global _expert_tensor_parallel_size, _expert_tensor_parallel_rank
-    global _data_parallel_ep
     _dp_size = dp_size
     _ep_size = ep_size
     _pp_size = pp_size
-    _ep_group = None
     _ep_rank = 0
     _expert_tensor_parallel_size = 1
     _expert_tensor_parallel_rank = 0
-    _data_parallel_ep = False
     init_tensor_parallel_group(tp_size, pp_size, rank, dp_size)
 
     model_group_size = tp_size * pp_size
-    dp_rank = rank // model_group_size
     rank_in_model_group = rank % model_group_size
     tp_rank = rank_in_model_group % tp_size
-    # DP is a request-placement dimension, not a collective dimension.  Keep
-    # an explicit group only for the legacy TP=1/DP=EP expert layout.
-    _dp_group = None
-
-    if ep_size > 1 and tp_size == 1 and pp_size == 1 and dp_size == ep_size:
-        # Legacy layout: DP attention ranks also own disjoint expert groups.
-        _data_parallel_ep = True
-        _ep_group = dist.group.WORLD
-        _ep_rank = dp_rank
-    else:
-        # Standard layout: EP divides TP.  Experts are grouped by EP rank,
-        # then each expert is optionally sharded across the remaining TP ranks.
-        _expert_tensor_parallel_size = tp_size // ep_size
-        _expert_tensor_parallel_rank = tp_rank % _expert_tensor_parallel_size
-        _ep_rank = tp_rank // _expert_tensor_parallel_size
+    # EP divides TP.  Experts are grouped by EP rank, then each expert is
+    # optionally sharded across the remaining TP ranks.
+    _expert_tensor_parallel_size = tp_size // ep_size
+    _expert_tensor_parallel_rank = tp_rank % _expert_tensor_parallel_size
+    _ep_rank = tp_rank // _expert_tensor_parallel_size
 
 
 def get_tp_group():
@@ -96,10 +78,6 @@ def get_tp_leader():
     return dist.get_rank() - get_tp_rank()
 
 
-def get_dp_group():
-    return _dp_group
-
-
 def get_dp_size():
     return _dp_size
 
@@ -108,18 +86,8 @@ def get_dp_rank():
     return dist.get_rank() // (get_tp_size() * _pp_size)
 
 
-def get_ep_group():
-    return _ep_group
-
-
 def get_ep_size():
     return _ep_size
-
-
-def get_ep_rank():
-    if _ep_group is not None:
-        return dist.get_rank(group=_ep_group)
-    return _ep_rank
 
 
 def get_local_ep_rank():
@@ -133,10 +101,6 @@ def get_expert_tensor_parallel_size():
 
 def get_expert_tensor_parallel_rank():
     return _expert_tensor_parallel_rank
-
-
-def is_data_parallel_ep():
-    return _data_parallel_ep
 
 
 def layer_range(num_layers: int, pp_size: int, pp_rank: int) -> range:

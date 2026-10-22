@@ -11,9 +11,7 @@ from nanovllm.utils.parallel import (
     get_tp_rank,
     get_tp_group,
     get_ep_size,
-    get_ep_rank,
-    get_ep_group,
-    is_data_parallel_ep,
+    get_local_ep_rank,
 )
 from nanovllm.layers.embed_head import VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
@@ -135,7 +133,7 @@ class OlmoeAttention(nn.Module):
 class OlmoeExperts(nn.ModuleDict):
     def __init__(self, config: OlmoeConfig, tp_fp32_matmul: bool = False):
         ep_size = get_ep_size()
-        ep_rank = get_ep_rank()
+        ep_rank = get_local_ep_rank()
         if config.num_experts % ep_size:
             raise ValueError("num_experts must be divisible by expert_parallel_size")
         experts_per_rank = config.num_experts // ep_size
@@ -216,43 +214,12 @@ class OlmoeMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The engine passes a flat [total_tokens, hidden_size] tensor.
         x = x.reshape(-1, x.shape[-1])
-        ep_size = get_ep_size()
-        if not is_data_parallel_ep():
-            _, top_k_weights, top_k_index = self.gate(x)
-            output = self.experts(x, top_k_index, top_k_weights)
-            tp_size = get_tp_size()
-            if tp_size > 1:
-                dist.all_reduce(output, group=get_tp_group())
-            return output
-
-        # Legacy TP=1/DP=EP layout: DP attention gives every rank only its own
-        # tokens.  Gather activations so every EP rank can compute the experts
-        # it owns, then reduce-scatter partial sums back to each token owner.
-        ep_group = get_ep_group()
-        ep_rank = get_ep_rank()
-        local_num_tokens = x.shape[0]
-        # Some NCCL builds in this environment corrupt tiny int64 collectives.
-        # Token counts are small enough for exact float32 representation.
-        local_count = torch.tensor([local_num_tokens], dtype=torch.float32,
-                                   device=x.device)
-        all_counts = [torch.empty_like(local_count) for _ in range(ep_size)]
-        dist.all_gather(all_counts, local_count, group=ep_group)
-        max_num_tokens = int(torch.stack(all_counts).max().item())
-        if max_num_tokens == 0:
-            return x
-        padded = x.new_zeros((max_num_tokens, x.shape[-1]))
-        if local_num_tokens:
-            padded[:local_num_tokens].copy_(x)
-        gathered = [torch.empty_like(padded) for _ in range(ep_size)]
-        dist.all_gather(gathered, padded.contiguous(), group=ep_group)
-        all_hidden_states = torch.cat(gathered, dim=0)
-        _, top_k_weights, top_k_index = self.gate(all_hidden_states)
-        all_outputs = self.experts(all_hidden_states, top_k_index, top_k_weights)
-        output_shards = [shard.contiguous()
-                         for shard in torch.chunk(all_outputs, ep_size, dim=0)]
-        local_output = torch.empty_like(output_shards[ep_rank])
-        dist.reduce_scatter(local_output, output_shards, group=ep_group)
-        return local_output[:local_num_tokens]
+        _, top_k_weights, top_k_index = self.gate(x)
+        output = self.experts(x, top_k_index, top_k_weights)
+        tp_size = get_tp_size()
+        if tp_size > 1:
+            dist.all_reduce(output, group=get_tp_group())
+        return output
 
 
 class OlmoeDecoderLayer(nn.Module):

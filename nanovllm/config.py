@@ -43,15 +43,9 @@ class Config:
             if getattr(self.hf_config, "num_experts", 0) % self.expert_parallel_size:
                 raise ValueError("num_experts must be divisible by expert_parallel_size")
             if self.expert_parallel_size > 1:
-                standard_ep = (self.expert_parallel_size <= self.tensor_parallel_size
-                               and self.tensor_parallel_size % self.expert_parallel_size == 0)
-                data_parallel_ep = (self.tensor_parallel_size == 1
-                                    and self.pipeline_parallel_size == 1
-                                    and self.data_parallel_size == self.expert_parallel_size)
-                if not (standard_ep or data_parallel_ep):
-                    raise ValueError(
-                        "OLMoE EP must divide tensor_parallel_size, or use "
-                        "TP=PP=1 with data_parallel_size == expert_parallel_size")
+                if (self.expert_parallel_size > self.tensor_parallel_size
+                        or self.tensor_parallel_size % self.expert_parallel_size):
+                    raise ValueError("OLMoE EP must divide tensor_parallel_size")
         elif self.expert_parallel_size != 1:
             raise ValueError("expert_parallel_size > 1 is only supported for MoE models")
         if not 1 <= self.pipeline_parallel_size <= self.hf_config.num_hidden_layers:
