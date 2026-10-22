@@ -5,12 +5,12 @@ from multiprocessing.connection import Connection
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.platforms import current_platform
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.parallel import init_tensor_parallel_group, layer_range
+from nanovllm.utils.parallel import init_parallel_groups, layer_range
 
 
 class ModelRunner:
@@ -18,26 +18,39 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int):
         self.config = config
         hf_config = config.hf_config
+        model_class = get_model_class(hf_config.model_type)
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        # Small-page gather reads dynamic block tables and is not graph-safe.
+        self.enforce_eager = (config.enforce_eager or self.block_size == 16
+                              or not getattr(model_class, "supports_cuda_graph", False))
         self.tp_size = config.tensor_parallel_size
+        self.dp_size = config.data_parallel_size
+        self.ep_size = config.expert_parallel_size
         self.pp_size = config.pipeline_parallel_size
-        self.world_size = self.tp_size * self.pp_size
+        self.world_size = self.tp_size * self.pp_size * self.dp_size
         self.rank = rank
-        self.tp_rank = rank % self.tp_size
-        self.pp_rank = rank // self.tp_size
+        rank_in_model_group = rank % (self.tp_size * self.pp_size)
+        self.dp_rank = rank // (self.tp_size * self.pp_size)
+        self.tp_rank = rank_in_model_group % self.tp_size
+        self.pp_rank = rank_in_model_group // self.tp_size
         self.local_layers = layer_range(hf_config.num_hidden_layers, self.pp_size, self.pp_rank)
         self.platform = current_platform
 
         self.platform.set_device(config.device_offset + rank)
         self.platform.init_process_group(self.world_size, rank, config.init_method)
-        init_tensor_parallel_group(self.tp_size, self.pp_size, rank)
+        init_parallel_groups(self.tp_size, self.pp_size, rank,
+                             self.dp_size, self.ep_size)
+        if self.world_size > 1:
+            dist.barrier()
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype"))
         self.platform.set_default_device()
-        self.model = Qwen3ForCausalLM(hf_config, self.pp_rank, self.pp_size,
-                                      tp_fp32_matmul=config.tp_fp32_matmul)
+        self.model = model_class(hf_config, self.pp_rank, self.pp_size,
+                                 tp_fp32_matmul=config.tp_fp32_matmul)
         load_model(self.model, config.model)
+        # Weight loading may enqueue asynchronous host-to-device copies. Warmup
+        # must not overlap those copies with distributed collectives.
+        self.platform.synchronize()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -60,7 +73,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        seqs = [Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs)
@@ -188,6 +201,19 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).to(self.platform.device(), non_blocking=True)
         return temperatures
 
+    def prepare_idle(self):
+        """Run one discarded token so empty DP ranks join MoE collectives."""
+        device = self.platform.device()
+        input_ids = torch.tensor([0], dtype=torch.int64, device=device)
+        positions = torch.tensor([0], dtype=torch.int64, device=device)
+        slot_mapping = torch.tensor([-1], dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        # Use the prefill path: warmup may run before the paged KV cache exists.
+        set_context(True, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=1, max_seqlen_k=1, slot_mapping=slot_mapping,
+                    context_lens=None, block_tables=None)
+        return input_ids, positions
+
     def prepare_mixed(self, seqs: list[Sequence]):
         decode_seqs = [seq for seq in seqs if not seq.is_prefill]
         prefill_seqs = [seq for seq in seqs if seq.is_prefill]
@@ -228,6 +254,11 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence]) -> list[int]:
+        if not seqs:
+            input_ids, positions = self.prepare_idle()
+            self.model(input_ids, positions)
+            reset_context()
+            return []
         is_prefill = all(seq.is_prefill for seq in seqs)
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
@@ -236,9 +267,10 @@ class ModelRunner:
         else:
             input_ids, positions = self.prepare_mixed(seqs)
         if self.pp_size == 1:
-            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            temperatures = self.prepare_sample(seqs) if self.tp_rank == 0 else None
             logits = self.run_model(input_ids, positions, is_prefill)
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            token_ids = (self.sampler(logits, temperatures).tolist()
+                         if self.tp_rank == 0 else None)
         else:
             token_ids = self.run_pipeline(input_ids, positions, seqs)
         reset_context()
@@ -268,13 +300,15 @@ class ModelRunner:
             if self.tp_rank == 0:
                 temperatures = self.prepare_sample(seqs)
                 sampled = self.sampler(logits, temperatures)
-                if self.rank != 0:
-                    dist.send(sampled.contiguous(), dst=0)
+                replica_base = self.dp_rank * self.tp_size * self.pp_size
+                if self.rank != replica_base:
+                    dist.send(sampled.contiguous(), dst=replica_base)
                 else:
                     return sampled.tolist()
-        if self.rank == 0:
+        replica_base = self.dp_rank * self.tp_size * self.pp_size
+        if self.rank == replica_base:
             sampled = torch.empty(len(seqs), dtype=torch.int64, device=self.platform.device())
-            dist.recv(sampled, src=(self.pp_size - 1) * self.tp_size)
+            dist.recv(sampled, src=replica_base + (self.pp_size - 1) * self.tp_size)
             return sampled.tolist()
         return None
 
@@ -318,7 +352,6 @@ class ModelRunner:
 
 def start_model_runner(config: Config, rank: int, connection: Connection):
     try:
-        Sequence.block_size = config.kvcache_block_size
         runner = ModelRunner(config, rank)
         connection.send(("ready", config.num_kvcache_blocks))
         while True:
@@ -328,7 +361,16 @@ def start_model_runner(config: Config, rank: int, connection: Connection):
                 connection.send(("ok", None))
                 break
             result = getattr(runner, method_name)(*args)
-            connection.send(("ok", result if rank == 0 or method_name == "export_kv" else None))
+            # One process per DP replica returns sampled tokens.  For PP, the
+            # replica's first rank receives the final-stage sample internally.
+            model_group_size = (config.tensor_parallel_size
+                                * config.pipeline_parallel_size)
+            replica_leader = (config.data_parallel_size > 1
+                              and method_name == "run"
+                              and rank % model_group_size == 0)
+            return_result = (rank == 0 or method_name == "export_kv"
+                             or replica_leader)
+            connection.send(("ok", result if return_result else None))
             # Drop both exported results and imported arguments after use;
             # retaining either keeps a potentially large /dev/shm KV file alive.
             result = None

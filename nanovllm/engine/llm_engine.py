@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler import DataParallelScheduler, Scheduler
 from nanovllm.engine.model_runner import start_model_runner
 from nanovllm.engine.worker_client import RunnerClient
 from nanovllm.platforms import current_platform
@@ -22,15 +22,15 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         self.config = config
-        world_size = config.tensor_parallel_size * config.pipeline_parallel_size
+        world_size = (config.data_parallel_size * config.tensor_parallel_size
+                      * config.pipeline_parallel_size)
         if config.device_offset + world_size > current_platform.device_count():
-            raise ValueError(f"TP × PP requires devices {config.device_offset}..{config.device_offset + world_size - 1}, "
+            raise ValueError(f"DP × TP × PP requires devices {config.device_offset}..{config.device_offset + world_size - 1}, "
                              f"found {current_platform.device_count()}")
         if not config.init_method:
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 config.init_method = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
-        Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.connections = []
         self._closed = False
@@ -52,7 +52,8 @@ class LLMEngine:
             config.num_kvcache_blocks = self.model_runner.receive("ready")
             self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
             config.eos = self.tokenizer.eos_token_id
-            self.scheduler = Scheduler(config)
+            self.scheduler = (Scheduler(config) if config.data_parallel_size == 1
+                              else DataParallelScheduler(config))
         except BaseException:
             self._close_workers(force=True)
             raise
@@ -96,20 +97,38 @@ class LLMEngine:
                       self.config.kvcache_block_size - 1) // self.config.kvcache_block_size
         if num_blocks > self.config.num_kvcache_blocks:
             raise ValueError("request exceeds available KV cache blocks")
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, self.config.kvcache_block_size)
         self.scheduler.add(seq)
 
     def step(self):
-        seqs = self.scheduler.schedule()
-        num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
-        num_decode = sum(seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill)
         try:
-            token_ids = self.model_runner.call("run", seqs)
+            if isinstance(self.scheduler, DataParallelScheduler):
+                rank_seqs = self.scheduler.schedule_ranks()
+                seqs = [seq for rank in rank_seqs for seq in rank]
+                model_group_size = (self.config.tensor_parallel_size
+                                    * self.config.pipeline_parallel_size)
+                args_by_rank = [
+                    (rank_seqs[rank // model_group_size],)
+                    for rank in range(self.config.data_parallel_size * model_group_size)
+                ]
+                results = self.model_runner.call_each("run", args_by_rank)
+                rank_token_ids = [
+                    results[dp_rank * model_group_size]
+                    for dp_rank in range(self.config.data_parallel_size)
+                ]
+                num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+                num_decode = sum(seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill)
+                self.scheduler.postprocess_ranks(rank_seqs, rank_token_ids)
+            else:
+                seqs = self.scheduler.schedule()
+                token_ids = self.model_runner.call("run", seqs)
+                num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+                num_decode = sum(seq.num_scheduled_tokens for seq in seqs if not seq.is_prefill)
+                self.scheduler.postprocess(seqs, token_ids)
         except BaseException:
             self._closed = True
             self._close_workers(force=True)
             raise
-        self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_prefill, num_decode
 
@@ -118,6 +137,8 @@ class LLMEngine:
 
     def _prefill_for_handoff(self, prompt: str | list[int], sampling_params: SamplingParams):
         """Compute a prompt, leaving its KV blocks owned by the returned sequence."""
+        if self.config.data_parallel_size > 1:
+            raise ValueError("PD handoff is not supported with data-parallel attention")
         if not self.scheduler.is_finished():
             raise RuntimeError("Prefill engine must be idle before a handoff")
         self.add_request(prompt, sampling_params)
@@ -128,7 +149,8 @@ class LLMEngine:
                 seqs = self.scheduler.schedule()
                 assert seqs == [seq] and seq.is_prefill
                 token_ids = self.model_runner.call("run", seqs)
-                self.scheduler.block_manager.hash_blocks(seq)
+                self.scheduler.block_manager.cache_blocks(seq)
+                self.scheduler.block_manager.radix.release(seq.seq_id)
                 seq.num_cached_tokens += seq.num_scheduled_tokens
                 seq.num_scheduled_tokens = 0
                 if seq.num_cached_tokens == seq.num_prompt_tokens:
@@ -169,8 +191,26 @@ class LLMEngine:
         seq, first_token = self._prefill_for_handoff(prompt, sampling_params)
         return KVLease(self, seq, first_token, sampling_params)
 
-    def resume_from_handoff(self, handoff):
+    def reserve_handoff(self, prompt: list[int], sampling_params: SamplingParams):
+        """Lock D's resident prefix before telling P which suffix to export.
+
+        Only the decode engine thread calls this method. The reservation also
+        owns the destination pages until import succeeds or the request fails.
+        """
+        seq = Sequence(prompt, sampling_params, self.config.kvcache_block_size)
+        manager = self.scheduler.block_manager
+        reused = len(manager.cached_blocks(prompt))
+        already_used = sum(manager.blocks[i].ref_count > 0
+                           for i in manager.cached_blocks(prompt, reused))
+        if len(manager.free_block_ids) < seq.num_blocks - already_used:
+            raise RuntimeError("Decode engine has insufficient KV blocks for the prompt")
+        manager.allocate(seq, reused)
+        return seq, reused
+
+    def resume_from_handoff(self, handoff, reserved=None):
         """Allocate local blocks, import prompt KV, then admit decode."""
+        if self.config.data_parallel_size > 1:
+            raise ValueError("PD handoff is not supported with data-parallel attention")
         if handoff.model != self.config.model or handoff.block_size != self.config.kvcache_block_size:
             raise ValueError("Prefill and decode model or KV block size differ")
         prompt = handoff.prompt_token_ids
@@ -181,25 +221,35 @@ class LLMEngine:
         required_blocks = (max_cached_tokens + self.config.kvcache_block_size - 1) // self.config.kvcache_block_size
         if required_blocks > self.config.num_kvcache_blocks:
             raise ValueError("Handoff exceeds the decode engine's KV cache capacity")
-        seq = Sequence(prompt, handoff.sampling_params)
+        seq = reserved[0] if reserved is not None else Sequence(
+            prompt, handoff.sampling_params, self.config.kvcache_block_size)
+        reused = reserved[1] if reserved is not None else 0
         manager = self.scheduler.block_manager
-        if len(manager.free_block_ids) < seq.num_blocks:
-            raise RuntimeError("Decode engine has insufficient KV blocks for the prompt")
-        manager.allocate(seq, 0)
+        if reserved is None:
+            if len(manager.free_block_ids) < seq.num_blocks:
+                raise RuntimeError("Decode engine has insufficient KV blocks for the prompt")
+            manager.allocate(seq, 0)
         try:
-            if isinstance(handoff.kv_blocks, list):
+            suffix = len(prompt) - reused * self.config.kvcache_block_size
+            destination = seq.block_table[reused:]
+            if not suffix:
+                if not isinstance(handoff.kv_blocks, list) or handoff.kv_blocks:
+                    raise ValueError("Unexpected KV payload for cached prompt")
+            elif isinstance(handoff.kv_blocks, list):
                 if len(handoff.kv_blocks) != (getattr(self.config, "tensor_parallel_size", 1) *
                                              getattr(self.config, "pipeline_parallel_size", 1)):
                     raise ValueError("PD KV shard count differs from TP × PP")
                 self.model_runner.call_each("import_kv", [
-                    (seq.block_table, len(prompt), blocks) for blocks in handoff.kv_blocks])
+                    (destination, suffix, blocks) for blocks in handoff.kv_blocks])
             elif (getattr(self.config, "tensor_parallel_size", 1) *
                   getattr(self.config, "pipeline_parallel_size", 1) == 1):
-                self.model_runner.call("import_kv", seq.block_table, len(prompt), handoff.kv_blocks)
+                self.model_runner.call("import_kv", destination, suffix, handoff.kv_blocks)
             else:
                 raise ValueError("PD requires one KV shard per model worker")
-            seq.num_scheduled_tokens = len(prompt)
-            manager.hash_blocks(seq)
+            # The reserved prefix is already indexed; only newly imported KV
+            # blocks need indexing. Counting it again overruns the block table.
+            seq.num_scheduled_tokens = len(prompt) - seq.num_cached_tokens
+            manager.cache_blocks(seq)
             seq.num_cached_tokens = len(prompt)
             seq.num_scheduled_tokens = 0
             seq.append_token(handoff.first_token_id)

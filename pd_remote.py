@@ -40,12 +40,15 @@ def main():
     parser.add_argument("--device", type=int, default=0, help="Local device ID on this host")
     parser.add_argument("--tp", type=int, default=1, help="Tensor-parallel workers per stage on each P/D")
     parser.add_argument("--pp", type=int, default=1, help="Pipeline stages on each P/D")
+    parser.add_argument("--block-size", type=int, choices=(16, 256), default=256,
+                        help="KV page size; 16 uses eager gather on CUDA")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--token-budget", type=int, default=128)
     parser.add_argument("--prompt", default="Introduce yourself in one sentence.")
     parser.add_argument("--max-tokens", type=int, default=12)
-    parser.add_argument("--cross-block", action="store_true", help="Use a 257-token prompt")
+    parser.add_argument("--cross-block", action="store_true",
+                        help="Use a 257-token prompt, crossing 256- or 16-token page boundaries")
     parser.add_argument("--compare", action="store_true", help="Compare output with local ordinary generation")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or args.timeout <= 0 or args.tp < 1 or args.pp < 1:
@@ -57,7 +60,8 @@ def main():
 
     options = dict(device_offset=args.device, gpu_memory_utilization=args.gpu_memory_utilization,
                    max_num_batched_tokens=args.token_budget, enforce_eager=True,
-                   tensor_parallel_size=args.tp, pipeline_parallel_size=args.pp)
+                   tensor_parallel_size=args.tp, pipeline_parallel_size=args.pp,
+                   kvcache_block_size=args.block_size)
     fingerprint = model_fingerprint(args.model)
     engine = LLMEngine(args.model, **options)
     try:
@@ -80,6 +84,7 @@ def main():
                                       fingerprint, args.timeout)
         for index, output in enumerate(outputs):
             print(f"Remote PD [{index}]:" if args.role == "routed" else "Remote PD:", output)
+        print("PD KV transfer:", engine.pd_transfer_stats)
     finally:
         engine.exit()
 

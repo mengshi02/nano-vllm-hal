@@ -22,7 +22,9 @@ llm = LLM("/path/to/Qwen3-0.6B", enforce_eager=True)
 outputs = llm.generate(["Introduce yourself"], SamplingParams(max_tokens=32))
 ```
 
-The engine supports continuous batching, paged KV cache with prefix reuse, chunked prefill, TP, and synchronous PP. For PD separation, start a decode process and connect a separate prefill process:
+The engine supports continuous batching, paged KV cache with radix prefix reuse, chunked prefill, TP, and synchronous PP. For PD separation, start a decode process and connect a separate prefill process:
+
+KV pages default to 256 tokens. For finer-grained prefix reuse, set `kvcache_block_size=16` in Python or `--block-size 16` in the PD examples; the CUDA 16-token path currently uses eager KV gather and is slower.
 
 ```bash
 # Decode host

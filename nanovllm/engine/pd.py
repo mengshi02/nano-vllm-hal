@@ -26,15 +26,19 @@ class KVLease:
         self.sampling_params = sampling_params
         self.released = False
 
-    def read(self):
+    def read(self, start_blocks: int = 0):
         if self.released:
             raise RuntimeError("KV lease has been released")
+        if not 0 <= start_blocks < len(self.sequence.block_table):
+            raise ValueError("Invalid KV suffix")
+        block_ids = self.sequence.block_table[start_blocks:]
+        num_tokens = self.sequence.num_prompt_tokens - start_blocks * self.engine.config.kvcache_block_size
         if (getattr(self.engine.config, "tensor_parallel_size", 1) *
                 getattr(self.engine.config, "pipeline_parallel_size", 1) > 1):
             return self.engine.model_runner.call_all(
-                "export_kv", self.sequence.block_table, self.sequence.num_prompt_tokens)
+                "export_kv", block_ids, num_tokens)
         return self.engine.model_runner.call(
-            "export_kv", self.sequence.block_table, self.sequence.num_prompt_tokens)
+            "export_kv", block_ids, num_tokens)
 
     def release(self):
         if not self.released:

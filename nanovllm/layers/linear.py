@@ -2,7 +2,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from nanovllm.utils.parallel import get_tp_group, get_tp_rank, get_tp_size
+from nanovllm.utils.parallel import (
+    get_expert_tensor_parallel_rank,
+    get_expert_tensor_parallel_size,
+    get_tp_group,
+    get_tp_rank,
+    get_tp_size,
+)
 
 
 def divide(numerator, denominator):
@@ -163,3 +169,52 @@ class RowParallelLinear(LinearBase):
         if self.tp_size > 1:
             dist.all_reduce(y, group=self.tp_group)
         return y.to(x.dtype) if self.fp32_matmul else y
+
+
+class ExpertLinearBase(nn.Module):
+    """A linear layer sharded only within one EP group of TP ranks."""
+
+    def __init__(self, input_size: int, output_size: int, tp_dim: int):
+        super().__init__()
+        self.tp_size = get_expert_tensor_parallel_size()
+        self.tp_rank = get_expert_tensor_parallel_rank()
+        self.tp_dim = tp_dim
+        if tp_dim == 0:
+            weight_size = (output_size // self.tp_size, input_size)
+        else:
+            weight_size = (output_size, input_size // self.tp_size)
+        self.weight = nn.Parameter(torch.empty(weight_size))
+        self.weight.weight_loader = self.weight_loader
+
+
+class ExpertColumnParallelLinear(ExpertLinearBase):
+
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__(input_size, output_size, 0)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        shard_size = param.size(self.tp_dim)
+        loaded_weight = loaded_weight.narrow(
+            self.tp_dim, self.tp_rank * shard_size, shard_size)
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
+
+
+class ExpertRowParallelLinear(ExpertLinearBase):
+
+    def __init__(self, input_size: int, output_size: int, fp32_matmul: bool = False):
+        super().__init__(input_size, output_size, 1)
+        self.fp32_matmul = fp32_matmul and self.tp_size > 1
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        shard_size = param.size(self.tp_dim)
+        loaded_weight = loaded_weight.narrow(
+            self.tp_dim, self.tp_rank * shard_size, shard_size)
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = (F.linear(x.float(), self.weight.float()) if self.fp32_matmul
+             else F.linear(x, self.weight))
+        return y.float().to(x.dtype) if self.fp32_matmul else y

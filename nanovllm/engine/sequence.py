@@ -15,7 +15,11 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams | None = None,
+                 block_size: int | None = None):
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        self.block_size = type(self).block_size if block_size is None else block_size
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -72,11 +76,13 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-                self.num_scheduled_tokens, self.block_table, last_state, self.temperature)
+                self.num_scheduled_tokens, self.block_table, last_state, self.temperature,
+                self.block_size)
 
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-         self.num_scheduled_tokens, self.block_table, last_state, self.temperature) = state
+         self.num_scheduled_tokens, self.block_table, last_state, self.temperature,
+         self.block_size) = state
         if isinstance(last_state, list):
             self.is_prefill = True
             self.token_ids = last_state

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from nanovllm.ops import kvcache
+from nanovllm.ops import kvcache, moe
 
 _KV_CACHE: dict[str, Any] = {"default": kvcache.store_kvcache}
+_MOE_AGGREGATE: dict[str, Any] = {"default": moe.aggregate_experts}
 _ATTENTION: dict[str, Any] = {}
 
 def _register_default_attention():
@@ -30,10 +31,11 @@ _register_ascend_ops()
 
 def _register_musa_ops():
     try:
-        from nanovllm.ops import musa_attention, musa_kvcache
+        from nanovllm.ops import musa_attention, musa_kvcache, musa_moe
 
         _ATTENTION["musa"] = musa_attention.attention_forward
         _KV_CACHE["musa"] = musa_kvcache.store_kvcache_musa
+        _MOE_AGGREGATE["musa"] = musa_moe.aggregate_experts
     except ImportError:
         pass
 
@@ -44,6 +46,9 @@ def _pick(family: dict[str, Any], backend_name: str):
 
 def get_kv_cache_fn(backend_name: str):
     return _pick(_KV_CACHE, backend_name)
+
+def get_moe_aggregate_fn(backend_name: str):
+    return _pick(_MOE_AGGREGATE, backend_name)
 
 def get_attention_fn(backend_name: str):
     fn = _ATTENTION.get(backend_name, _ATTENTION["default"])

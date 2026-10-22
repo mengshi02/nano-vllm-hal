@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from queue import SimpleQueue, Empty
+from threading import Event
 import hashlib
 import json
 import math
@@ -132,12 +134,29 @@ class PulledKV:
 
     location: KVLocation
     blocks: torch.Tensor | list[torch.Tensor] | None
+    reused_blocks: int = 0
 
     def take(self) -> torch.Tensor | list[torch.Tensor]:
         if self.blocks is None:
             raise RuntimeError("KV has already been consumed")
         blocks, self.blocks = self.blocks, None
         return blocks
+
+
+@dataclass
+class PullPlan:
+    location: KVLocation
+    ready: Event
+    reused_blocks: int = 0
+    error: Exception | None = None
+
+
+@dataclass
+class PrefixProbe:
+    tokens: list[int]
+    ready: Event
+    cached_blocks: int = 0
+    error: Exception | None = None
 
 
 def send_metadata(connection: socket.socket, lease, fingerprint: str, request_id: str):
@@ -155,8 +174,19 @@ def send_metadata(connection: socket.socket, lease, fingerprint: str, request_id
     })
 
 
-def receive_metadata(connection: socket.socket, engine, fingerprint: str) -> KVLocation:
+def receive_metadata(connection: socket.socket, engine, fingerprint: str,
+                     allow_probe: bool = False) -> KVLocation | dict:
     def validate(header, size):
+        if allow_probe and header.get("kind") == "probe":
+            tokens = header.get("prompt")
+            if (size or header.get("model_sha256") != fingerprint or
+                    header.get("block_size") != engine.config.kvcache_block_size or
+                    not isinstance(tokens, list) or not tokens or
+                    len(tokens) > engine.config.max_model_len or
+                    not all(type(token) is int and 0 <= token < engine.config.hf_config.vocab_size
+                            for token in tokens)):
+                raise ValueError("Invalid PD prefix probe")
+            return
         if size or header.get("kind") != "location":
             raise ValueError("Invalid PD location")
         _validate_location(header, engine, fingerprint)
@@ -176,6 +206,8 @@ def receive_metadata(connection: socket.socket, engine, fingerprint: str) -> KVL
             raise ValueError("PD KV exceeds the transport limit")
 
     header, _ = _recv_frame(connection, validate, 0)
+    if header["kind"] == "probe":
+        return header
     return KVLocation(header["request_id"], header["prompt"], header["first_token"],
                       SamplingParams(**header["sampling"]), header["block_ids"],
                       tuple(header["shape"]), _DTYPES[header["dtype"]],
@@ -184,20 +216,25 @@ def receive_metadata(connection: socket.socket, engine, fingerprint: str) -> KVL
                       header.get("tp_size", 1), header.get("pp_size", 1))
 
 
-def send_pull(connection: socket.socket, location: KVLocation):
+def send_pull(connection: socket.socket, location: KVLocation, reused_blocks: int = 0):
     _send_frame(connection, {"kind": "pull", "request_id": location.request_id,
-                             "block_ids": location.block_ids})
+                             "block_ids": location.block_ids[reused_blocks:],
+                             "reused_blocks": reused_blocks})
 
 
-def receive_pull(connection: socket.socket, lease, request_id: str):
+def receive_pull(connection: socket.socket, lease, request_id: str) -> int:
     def validate(header, size):
+        reused = header.get("reused_blocks", 0)
+        max_reused = lease.sequence.num_prompt_tokens // lease.engine.config.kvcache_block_size
         if header.get("kind") == "error":
             raise RuntimeError(f"Decode server: {header.get('message', 'unknown error')}")
         if (size or header.get("kind") != "pull" or header.get("request_id") != request_id
-                or header.get("block_ids") != lease.sequence.block_table):
+                or type(reused) is not int or not 0 <= reused <= max_reused
+                or header.get("block_ids") != lease.sequence.block_table[reused:]):
             raise ValueError("Invalid PD KV pull request")
 
-    _recv_frame(connection, validate, 0)
+    header, _ = _recv_frame(connection, validate, 0)
+    return header.get("reused_blocks", 0)
 
 
 def send_kv_blocks(connection: socket.socket, request_id: str, blocks: torch.Tensor,
@@ -211,8 +248,11 @@ def send_kv_blocks(connection: socket.socket, request_id: str, blocks: torch.Ten
     _send_frame(connection, header, raw)
 
 
-def receive_kv_blocks(connection: socket.socket, location: KVLocation, rank: int = 0) -> torch.Tensor:
-    shape = location.rank_shapes[rank]
+def receive_kv_blocks(connection: socket.socket, location: KVLocation, rank: int = 0,
+                      reused_blocks: int = 0) -> torch.Tensor:
+    shape = (*location.rank_shapes[rank][:2],
+             location.rank_shapes[rank][2] - reused_blocks,
+             *location.rank_shapes[rank][3:])
     expected_size = math.prod(shape) * location.dtype.itemsize
 
     def validate(header, size):
@@ -311,21 +351,31 @@ def _handoff_remote(engine, prompt, params, host, port, fingerprint, timeout):
             if remaining <= 0:
                 raise TimeoutError("PD KV lease expired before D pulled its blocks")
             connection.settimeout(remaining)
-            receive_pull(connection, lease, request_id)
+            reused_blocks = receive_pull(connection, lease, request_id)
             if monotonic() >= deadline:
                 raise TimeoutError("PD KV lease expired before D pulled its blocks")
             connection.settimeout(timeout)
-            blocks = lease.read()
-            if isinstance(blocks, list):
-                if len(blocks) != (getattr(engine.config, "tensor_parallel_size", 1) *
-                                   getattr(engine.config, "pipeline_parallel_size", 1)):
-                    raise ValueError("Prefill did not export every KV rank")
-                for rank, shard in enumerate(blocks):
-                    send_kv_blocks(connection, request_id, shard, rank)
-            else:
-                send_kv_blocks(connection, request_id, blocks)
-            del blocks
+            sent_bytes = 0
+            if reused_blocks < len(lease.sequence.block_table):
+                blocks = lease.read(reused_blocks)
+                if isinstance(blocks, list):
+                    if len(blocks) != (getattr(engine.config, "tensor_parallel_size", 1) *
+                                       getattr(engine.config, "pipeline_parallel_size", 1)):
+                        raise ValueError("Prefill did not export every KV rank")
+                    for rank, shard in enumerate(blocks):
+                        send_kv_blocks(connection, request_id, shard, rank)
+                        sent_bytes += shard.numel() * shard.element_size()
+                else:
+                    send_kv_blocks(connection, request_id, blocks)
+                    sent_bytes = blocks.numel() * blocks.element_size()
+                del blocks
             receive_ack(connection, request_id)
+            stats = getattr(engine, "pd_transfer_stats", None)
+            if stats is None:
+                stats = engine.pd_transfer_stats = dict(requests=0, reused_blocks=0, kv_bytes=0)
+            stats["requests"] += 1
+            stats["reused_blocks"] += reused_blocks
+            stats["kv_bytes"] += sent_bytes
             first_token_id = lease.first_token_id
             # The P worker can prefill another request as soon as D owns KV.
             lease.release()
@@ -350,6 +400,20 @@ def _normalize_requests(prompts, sampling_params):
     return sampling_params
 
 
+def _probe_prefix(host, port, prompt, fingerprint, block_size, timeout):
+    with socket.create_connection((host, port), timeout=timeout) as connection:
+        connection.settimeout(timeout)
+        _send_frame(connection, {"kind": "probe", "model_sha256": fingerprint,
+                                 "block_size": block_size, "prompt": prompt})
+        def validate(header, size):
+            if (size or header.get("kind") != "probe_result" or
+                    type(header.get("cached_blocks")) is not int or
+                    not 0 <= header["cached_blocks"] <= len(prompt) // block_size):
+                raise ValueError("Invalid PD prefix probe result")
+        header, _ = _recv_frame(connection, validate, 0)
+        return header["cached_blocks"]
+
+
 def generate_remote(engine, prompts, sampling_params, host: str, port: int,
                     fingerprint: str, timeout: float = 300.0) -> list[dict]:
     sampling_params = _normalize_requests(prompts, sampling_params)
@@ -365,7 +429,7 @@ def generate_remote(engine, prompts, sampling_params, host: str, port: int,
 def generate_remote_routed(engine, prompts, sampling_params, endpoints: list[tuple[str, int]],
                            fingerprint: str, timeout: float = 300.0,
                            max_inflight: int = 2) -> list[dict]:
-    """Round-robin D routing; overlap serial P prefills with outstanding D decodes.
+    """Route to a D with a resident prefix, falling back to round-robin.
 
     Only this thread touches the model worker. Each socket belongs to P until
     its result arrives; an ACK transfers KV ownership, not result ownership.
@@ -402,9 +466,32 @@ def generate_remote_routed(engine, prompts, sampling_params, endpoints: list[tup
         for index, (prompt, params) in enumerate(zip(prompts, sampling_params)):
             while len(pending) >= max_inflight:
                 collect_one()
-            host, port = next(routes)
-            connection, first_token_id = _handoff_remote(
-                engine, prompt, params, host, port, fingerprint, timeout)
+            preferred = next(routes)
+            candidates = [preferred, *(endpoint for endpoint in endpoints if endpoint != preferred)]
+            if len(endpoints) > 1:
+                tokens = engine.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
+                # Rotate tie priority so a cold cache still distributes work.
+                offset = endpoints.index(preferred)
+                candidates = endpoints[offset:] + endpoints[:offset]
+                scores = {}
+                for candidate_host, candidate_port in candidates:
+                    try:
+                        scores[(candidate_host, candidate_port)] = _probe_prefix(
+                            candidate_host, candidate_port, tokens, fingerprint,
+                            engine.config.kvcache_block_size, min(timeout, 2.0))
+                    except (OSError, ValueError, TimeoutError, EOFError):
+                        scores[(candidate_host, candidate_port)] = -1
+                # A reachable cold D beats an unreachable preferred D. Probe
+                # results are hints: the selected D reserves again on handoff.
+                candidates.sort(key=lambda endpoint: scores[endpoint], reverse=True)
+            for attempt, (host, port) in enumerate(candidates):
+                try:
+                    connection, first_token_id = _handoff_remote(
+                        engine, prompt, params, host, port, fingerprint, timeout)
+                    break
+                except (OSError, TimeoutError, EOFError):
+                    if attempt == len(candidates) - 1:
+                        raise
             pending[connection] = (index, params, first_token_id, monotonic() + timeout)
         while pending:
             collect_one()
@@ -414,16 +501,36 @@ def generate_remote_routed(engine, prompts, sampling_params, endpoints: list[tup
             connection.close()
 
 
-def _pull_into_cpu(connection, engine, fingerprint):
+def _pull_into_cpu(connection, engine, fingerprint, planning: SimpleQueue | None = None):
     """Network-only D task: the model worker is exclusively owned by the main thread."""
-    location = receive_metadata(connection, engine, fingerprint)
-    send_pull(connection, location)
-    if len(location.rank_shapes) == 1:
-        blocks = receive_kv_blocks(connection, location)
+    location = receive_metadata(connection, engine, fingerprint, allow_probe=planning is not None)
+    if isinstance(location, dict):
+        probe = PrefixProbe(location["prompt"], Event())
+        planning.put((connection, probe))
+        if not probe.ready.wait(connection.gettimeout()):
+            raise TimeoutError("Timed out waiting for D prefix lookup")
+        if probe.error is not None:
+            raise probe.error
+        _send_frame(connection, {"kind": "probe_result", "cached_blocks": probe.cached_blocks})
+        return None
+    reused = 0
+    if planning is not None:
+        plan = PullPlan(location, Event())
+        planning.put((connection, plan))
+        if not plan.ready.wait(connection.gettimeout()):
+            raise TimeoutError("Timed out waiting for D to reserve KV pages")
+        if plan.error is not None:
+            raise plan.error
+        reused = plan.reused_blocks
+    send_pull(connection, location, reused)
+    if reused == location.shape[2]:
+        blocks = []
+    elif len(location.rank_shapes) == 1:
+        blocks = receive_kv_blocks(connection, location, reused_blocks=reused)
     else:
-        blocks = [receive_kv_blocks(connection, location, rank)
+        blocks = [receive_kv_blocks(connection, location, rank, reused)
                   for rank in range(len(location.rank_shapes))]
-    return PulledKV(location, blocks)
+    return PulledKV(location, blocks, reused)
 
 
 def _send_error(connection, exc):
@@ -435,6 +542,8 @@ def _send_error(connection, exc):
 
 def serve_decode(engine, bind: str, port: int, fingerprint: str, timeout: float = 300.0):
     engine.scheduler.decode_only = True
+    planning = SimpleQueue()
+    reservations = {}  # connection -> (sequence, reused blocks), main thread only
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=2) as transfers:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((bind, port))
@@ -454,23 +563,46 @@ def serve_decode(engine, bind: str, port: int, fingerprint: str, timeout: float 
                         pass
                     else:
                         connection.settimeout(timeout)
-                        pending[transfers.submit(_pull_into_cpu, connection, engine, fingerprint)] = connection
+                        pending[transfers.submit(_pull_into_cpu, connection, engine, fingerprint, planning)] = connection
                 else:
                     sleep(0.01)
+
+                while True:
+                    try:
+                        connection, plan = planning.get_nowait()
+                    except Empty:
+                        break
+                    try:
+                        if isinstance(plan, PrefixProbe):
+                            plan.cached_blocks = len(engine.scheduler.block_manager.cached_blocks(plan.tokens))
+                        else:
+                            reserved = engine.reserve_handoff(plan.location.prompt_token_ids,
+                                                              plan.location.sampling_params)
+                            reservations[connection] = reserved
+                            plan.reused_blocks = reserved[1]
+                    except Exception as exc:
+                        plan.error = exc
+                    finally:
+                        plan.ready.set()
 
                 for future, connection in list(pending.items()):
                     if not future.done():
                         continue
                     del pending[future]
                     seq = None
+                    reserved = reservations.pop(connection, None)
                     try:
                         received = future.result()
+                        if received is None:  # Probe only; no KV ownership changed.
+                            connection.close()
+                            continue
                         location = received.location
                         handoff = KVHandoff(location.prompt_token_ids, location.first_token_id,
                                             location.sampling_params, received.take(),
                                             location.model, location.block_size)
                         try:
-                            seq = engine.resume_from_handoff(handoff)
+                            seq = engine.resume_from_handoff(handoff, reserved=reserved)
+                            reserved = None
                         finally:
                             # Sending torch CPU tensors to a model worker can
                             # share their storage through /dev/shm. A Future's
@@ -483,6 +615,8 @@ def serve_decode(engine, bind: str, port: int, fingerprint: str, timeout: float 
                             send_result(connection, seq.completion_token_ids)
                             connection.close()
                     except Exception as exc:
+                        if reserved is not None and reserved[0].block_table:
+                            engine.scheduler.block_manager.deallocate(reserved[0])
                         if seq is not None and active.get(seq.seq_id) is connection:
                             active.pop(seq.seq_id)
                             engine.scheduler.running.remove(seq)
@@ -504,5 +638,7 @@ def serve_decode(engine, bind: str, port: int, fingerprint: str, timeout: float 
                             finally:
                                 connection.close()
         finally:
+            for reserved in reservations.values():
+                engine.scheduler.block_manager.deallocate(reserved[0])
             for connection in (*pending.values(), *active.values()):
                 connection.close()

@@ -1,0 +1,6 @@
+# Keep test fixtures, reports, and parity harnesses in the development repository
+# without shipping them in source distributions.
+global-exclude *.py[cod]
+global-exclude __pycache__
+prune tests
+recursive-exclude tests *

@@ -11,6 +11,9 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    prefix_cache: str = "radix"
     tp_fp32_matmul: bool = False
     pipeline_parallel_size: int = 1
     device_offset: int = 0
@@ -24,13 +27,33 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        if self.kvcache_block_size != 16 and self.kvcache_block_size % 256:
+            raise ValueError("KV block size must be 16 or a multiple of 256")
         assert 1 <= self.tensor_parallel_size <= 8
+        if self.data_parallel_size < 1 or self.expert_parallel_size < 1:
+            raise ValueError("data_parallel_size and expert_parallel_size must be positive")
+        if self.prefix_cache != "radix":
+            raise ValueError("prefix_cache must be 'radix'")
         if self.device_offset < 0:
             raise ValueError("device_offset must be non-negative")
         if self.worker_timeout <= 0:
             raise ValueError("worker_timeout must be positive")
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.hf_config.model_type == "olmoe":
+            if getattr(self.hf_config, "num_experts", 0) % self.expert_parallel_size:
+                raise ValueError("num_experts must be divisible by expert_parallel_size")
+            if self.expert_parallel_size > 1:
+                standard_ep = (self.expert_parallel_size <= self.tensor_parallel_size
+                               and self.tensor_parallel_size % self.expert_parallel_size == 0)
+                data_parallel_ep = (self.tensor_parallel_size == 1
+                                    and self.pipeline_parallel_size == 1
+                                    and self.data_parallel_size == self.expert_parallel_size)
+                if not (standard_ep or data_parallel_ep):
+                    raise ValueError(
+                        "OLMoE EP must divide tensor_parallel_size, or use "
+                        "TP=PP=1 with data_parallel_size == expert_parallel_size")
+        elif self.expert_parallel_size != 1:
+            raise ValueError("expert_parallel_size > 1 is only supported for MoE models")
         if not 1 <= self.pipeline_parallel_size <= self.hf_config.num_hidden_layers:
             raise ValueError("pipeline_parallel_size must be between 1 and num_hidden_layers")
         if (self.hf_config.num_attention_heads % self.tensor_parallel_size or

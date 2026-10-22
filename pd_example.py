@@ -15,6 +15,8 @@ if __name__ == "__main__":
     parser.add_argument("--devices", nargs=2, type=int, default=(0, 1), metavar=("P", "D"))
     parser.add_argument("--tp", type=int, default=1, help="Tensor-parallel workers per stage on P and D")
     parser.add_argument("--pp", type=int, default=1, help="Pipeline stages on P and D")
+    parser.add_argument("--ep", type=int, default=1, help="Expert-parallel groups; must divide TP for MoE")
+    parser.add_argument("--block-size", type=int, choices=(16, 256), default=256)
     parser.add_argument("--prompt", default="Introduce yourself in one sentence.")
     parser.add_argument("--max-tokens", type=int, default=24)
     parser.add_argument("--token-budget", type=int, default=128,
@@ -24,13 +26,15 @@ if __name__ == "__main__":
     parser.add_argument("--compare", action="store_true",
                         help="Compare every generated token with ordinary inference using the same TP/PP")
     parser.add_argument("--cross-block", action="store_true",
-                        help="Extend the prompt past one 256-token KV block")
+                        help="Use a 257-token prompt, crossing 256- or 16-token page boundaries")
     args = parser.parse_args()
 
     params = SamplingParams(temperature=1e-5, max_tokens=args.max_tokens)
     engine_options = dict(max_num_batched_tokens=args.token_budget, enforce_eager=True,
                           gpu_memory_utilization=args.gpu_memory_utilization,
-                          tensor_parallel_size=args.tp, pipeline_parallel_size=args.pp)
+                          tensor_parallel_size=args.tp, pipeline_parallel_size=args.pp,
+                          expert_parallel_size=args.ep,
+                          kvcache_block_size=args.block_size)
     with DisaggregatedLLM(args.model, devices=tuple(args.devices),
                            **engine_options) as llm:
         prompt = llm.prefill.tokenizer.encode(args.prompt)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from nanovllm.ops.attention_gather import attention_forward_gather
 from nanovllm.utils.context import Context
 
 def attention_forward_flash(
@@ -14,6 +15,12 @@ def attention_forward_flash(
     scale: float,
     context: Context,
 ) -> torch.Tensor:
+    if k_cache.ndim >= 2 and k_cache.shape[1] == 16:
+        # FA2's paged kernels require 256-token pages. Gather the physical
+        # 16-token pages before attention, keeping the same KV block table.
+        # This is an eager learning fallback, not a native paged GPU kernel.
+        return attention_forward_gather(q, k, v, k_cache, v_cache, scale,
+                                        context, flash_attn_varlen_func)
     if context.is_prefill:
         if context.block_tables is not None:
             k, v = k_cache, v_cache

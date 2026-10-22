@@ -49,7 +49,10 @@ class CUDAPlatform(Platform):
         torch.cuda.synchronize()
 
     def init_process_group(self, world_size: int, rank: int, init_method: str = "tcp://localhost:2333") -> None:
-        dist.init_process_group("nccl", init_method, world_size=world_size, rank=rank)
+        dist.init_process_group(
+            "nccl", init_method, world_size=world_size, rank=rank,
+            device_id=torch.device("cuda", torch.cuda.current_device()),
+        )
 
     def destroy_process_group(self) -> None:
         dist.destroy_process_group()
